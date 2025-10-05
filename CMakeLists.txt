@@ -3,14 +3,21 @@ project(Diva
         VERSION 1.0
         HOMEPAGE_URL https://github.com/n3slami/Diva)
 
-option(BUILD_TESTS "Build the tests" ON)
-option(BUILD_EXAMPLES "Build the examples" ON)
-option(BUILD_BENCHMARKS "Build the benchmark targets" ON)
+# enable wormhole global slab
+add_definitions(-DWORMHOLE_NO_DEBUG)
+add_definitions(-DWORMHOLE_DISABLE_MLOCK)
+add_definitions(-DWORMHOLE_GLOBAL_SLAB)
+add_definitions(-DWORMHOLE_DISABLE_QSBR)
+#add_definitions(-DHEAPCHECKING)
+
+option(BUILD_TESTS "Build the tests" On)
+option(BUILD_EXAMPLES "Build the examples" Off)
+option(BUILD_BENCHMARKS "Build the benchmark targets" Off)
 
 set(CMAKE_CXX_STANDARD 17)
 if (CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
-else()
+else ()
     set(USE_MULTI_THREADED OFF)
 endif ()
 
@@ -69,7 +76,7 @@ if (BUILD_BENCHMARKS)
 
         message(STATUS "Building WiredTiger")
         execute_process(COMMAND bash -c "cd ../bench/scripts && bash build_wiredtiger.sh")
-    endif()
+    endif ()
 
     message(STATUS "Building benchmarks")
     add_subdirectory(bench)

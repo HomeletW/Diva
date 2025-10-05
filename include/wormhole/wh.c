@@ -94,7 +94,7 @@ struct wormhole {
   struct wormleaf * leaf0; // usually not used
   // 1 line
   struct kvmap_mm mm;
-  struct qsbr * qsbr;
+  struct qsbr * qsbr;  // kept here to ensure stable structure
   struct slab * slab_leaf;
   struct kv * pbuf;
   u32 leaftype;
@@ -107,6 +107,56 @@ struct wormhole {
 };
 
 // }}} struct
+
+// global slabs
+#ifdef WORMHOLE_GLOBAL_SLAB
+struct slab *g_hmap0_slab1 = NULL;
+struct slab *g_hmap0_slab2 = NULL;
+struct slab *g_hmap1_slab1 = NULL;
+struct slab *g_hmap1_slab2 = NULL;
+struct slab *g_slab_leaf = NULL;
+long g_slab_ref_counter = 0;
+pthread_mutex_t g_slab_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void global_slab_acquire(void) {
+  pthread_mutex_lock(&g_slab_mutex);
+
+  if (g_slab_ref_counter == 0) {
+    // first ref initialization
+    g_hmap0_slab1 = slab_create(sizeof(struct wormmeta), WH_SLABMETA_SIZE);
+    g_hmap0_slab2 = slab_create(sizeof(struct wormmeta) + (sizeof(u64) * WH_BMNR), WH_SLABMETA_SIZE);
+    g_hmap1_slab1 = slab_create(sizeof(struct wormmeta), WH_SLABMETA_SIZE);
+    g_hmap1_slab2 = slab_create(sizeof(struct wormmeta) + (sizeof(u64) * WH_BMNR), WH_SLABMETA_SIZE);
+    g_slab_leaf = slab_create(sizeof(struct wormleaf), WH_SLABLEAF_SIZE);
+  }
+
+  g_slab_ref_counter += 1;
+
+  pthread_mutex_unlock(&g_slab_mutex);
+}
+
+void global_slab_release(void) {
+  pthread_mutex_lock(&g_slab_mutex);
+
+  g_slab_ref_counter -= 1;
+
+  if (g_slab_ref_counter == 0) {
+    // destroy after no ref
+    slab_destroy(g_hmap0_slab1);
+    slab_destroy(g_hmap0_slab2);
+    slab_destroy(g_hmap1_slab1);
+    slab_destroy(g_hmap1_slab2);
+    slab_destroy(g_slab_leaf);
+    g_hmap0_slab1 = NULL;
+    g_hmap0_slab2 = NULL;
+    g_hmap1_slab1 = NULL;
+    g_hmap1_slab2 = NULL;
+    g_slab_leaf = NULL;
+  }
+
+  pthread_mutex_unlock(&g_slab_mutex);
+}
+#endif
 
 // helpers {{{
 
@@ -458,7 +508,11 @@ wormmeta_alloc(struct wormhmap * const hmap, struct wormleaf * const lrmost,
   debug_assert(alen <= UINT16_MAX);
   debug_assert(lrmost && keyref);
 
+#ifdef WORMHOLE_GLOBAL_SLAB
+  struct wormmeta * const meta = slab_alloc_safe(hmap->slab1);
+#else
   struct wormmeta * const meta = slab_alloc_unsafe(hmap->slab1);
+#endif
   if (meta == NULL)
     return NULL;
 
@@ -473,6 +527,8 @@ wormhole_slab_reserve(struct wormhole * const map, const u32 nr)
   if (alloc_fail())
     return false;
 #endif
+  // Skip reserve on global slab
+#ifndef WORMHOLE_GLOBAL_SLAB
   for (u32 i = 0; i < 2; i++) {
     if (!(map->hmap2[i].slab1 && map->hmap2[i].slab2))
       continue;
@@ -481,6 +537,7 @@ wormhole_slab_reserve(struct wormhole * const map, const u32 nr)
     if (!slab_reserve_unsafe(map->hmap2[i].slab2, nr))
       return false;
   }
+#endif
   return true;
 }
 
@@ -498,7 +555,17 @@ wormmeta_keyref_release(struct wormmeta * const meta)
 wormmeta_free(struct wormhmap * const hmap, struct wormmeta * const meta)
 {
   wormmeta_keyref_release(meta);
+#ifdef WORMHOLE_GLOBAL_SLAB
+  // determine which slab to free towards
+  const bool is_full = wormmeta_bitmin_load(meta) < wormmeta_bitmax_load(meta);
+  if (is_full) {
+    slab_free_safe(hmap->slab2, meta);
+  } else {
+    slab_free_safe(hmap->slab1, meta);
+  }
+#else
   slab_free_unsafe(hmap->slab1, meta);
+#endif
 }
 // }}} alloc
 
@@ -506,11 +573,14 @@ wormmeta_free(struct wormhmap * const hmap, struct wormmeta * const meta)
   static void
 wormleaf_lock_write(struct wormleaf * const leaf, struct wormref * const ref)
 {
-    
   if (!rwlock_trylock_write(&(leaf->leaflock))) {
+#ifndef WORMHOLE_DISABLE_QSBR
     wormhole_park(ref);
     rwlock_lock_write(&(leaf->leaflock));
     wormhole_resume(ref);
+#else
+    rwlock_lock_write(&(leaf->leaflock));
+#endif
   }
 }
 
@@ -518,9 +588,13 @@ wormleaf_lock_write(struct wormleaf * const leaf, struct wormref * const ref)
 wormleaf_lock_read(struct wormleaf * const leaf, struct wormref * const ref)
 {
   if (!rwlock_trylock_read(&(leaf->leaflock))) {
+#ifndef WORMHOLE_DISABLE_QSBR
     wormhole_park(ref);
     rwlock_lock_read(&(leaf->leaflock));
     wormhole_resume(ref);
+#else
+    rwlock_lock_read(&(leaf->leaflock));
+#endif
   }
 }
 
@@ -541,9 +615,14 @@ wormleaf_unlock_read(struct wormleaf * const leaf)
 wormhmap_lock(struct wormhole * const map, struct wormref * const ref)
 {
   if (!rwlock_trylock_write(&(map->metalock))) {
+#ifndef WORMHOLE_DISABLE_QSBR
     wormhole_park(ref);
     rwlock_lock_write(&(map->metalock));
     wormhole_resume(ref);
+#else
+    (void) ref;
+    rwlock_lock_write(&(map->metalock));
+#endif
   }
 }
 
@@ -552,6 +631,28 @@ wormhmap_unlock(struct wormhole * const map)
 {
   rwlock_unlock_write(&(map->metalock));
 }
+
+static void
+wormhmap_lock_read(struct wormhole * const map, struct wormref * const ref)
+{
+  if (!rwlock_trylock_read(&(map->metalock))) {
+#ifndef WORMHOLE_DISABLE_QSBR
+    wormhole_park(ref);
+    rwlock_lock_read(&(map->metalock));
+    wormhole_resume(ref);
+#else
+    (void) ref;
+    rwlock_lock_read(&(map->metalock));
+#endif
+  }
+}
+
+static inline void
+wormhmap_unlock_read(struct wormhole * const map)
+{
+  rwlock_unlock_read(&(map->metalock));
+}
+
 // }}} lock
 
 // hmap-version {{{
@@ -640,9 +741,14 @@ wormhole_kref_kv_match(const struct kref * const key, const struct kv * const cu
   static inline void
 wormhole_qsbr_update_pause(struct wormref * const ref, const u64 v)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
   qsbr_update(&ref->qref, v);
 #if defined(CORR)
   corr_yield();
+#endif
+#else
+  (void) ref;
+  (void) v;
 #endif
 }
 // }}} co
@@ -1107,6 +1213,11 @@ wormhole_create_internal(const struct kvmap_mm * const mm, const u32 nh)
   // mm
   map->mm = mm ? (*mm) : kvmap_mm_dup;
 
+#ifdef WORMHOLE_GLOBAL_SLAB
+  // acquire global slab
+  global_slab_acquire();
+#endif
+
   // pbuf for meta-merge
   map->pbuf = yalloc(1lu << 16); // 64kB
   if (map->pbuf == NULL)
@@ -1118,24 +1229,40 @@ wormhole_create_internal(const struct kvmap_mm * const mm, const u32 nh)
     if (!wormhmap_init(hmap, map->pbuf))
       goto fail;
 
+#ifdef WORMHOLE_GLOBAL_SLAB
+    hmap->slab1 = i == 0 ? g_hmap0_slab1 : g_hmap1_slab1;
+#else
     hmap->slab1 = slab_create(sizeof(struct wormmeta), WH_SLABMETA_SIZE);
+#endif
     if (hmap->slab1 == NULL)
       goto fail;
 
+#ifdef WORMHOLE_GLOBAL_SLAB
+    hmap->slab2 = i == 0 ? g_hmap0_slab2 : g_hmap1_slab2;
+#else
     hmap->slab2 = slab_create(sizeof(struct wormmeta) + (sizeof(u64) * WH_BMNR), WH_SLABMETA_SIZE);
+#endif
     if (hmap->slab2 == NULL)
       goto fail;
   }
 
   // leaf slab
+#ifdef WORMHOLE_GLOBAL_SLAB
+  map->slab_leaf = g_slab_leaf;
+#else
   map->slab_leaf = slab_create(sizeof(struct wormleaf), WH_SLABLEAF_SIZE);
+#endif
   if (map->slab_leaf == NULL)
     goto fail;
 
   // qsbr
+#ifndef WORMHOLE_DISABLE_QSBR
   map->qsbr = qsbr_create();
   if (map->qsbr == NULL)
     goto fail;
+#else
+  map->qsbr = NULL;
+#endif
 
   // leaf0
   if (!wormhole_create_leaf0(map))
@@ -1146,20 +1273,25 @@ wormhole_create_internal(const struct kvmap_mm * const mm, const u32 nh)
   return map;
 
 fail:
+#ifndef WORMHOLE_DISABLE_QSBR
   if (map->qsbr)
     qsbr_destroy(map->qsbr);
-
-  if (map->slab_leaf)
-    slab_destroy(map->slab_leaf);
+#endif
 
   for (u32 i = 0; i < nh; i++) {
     struct wormhmap * const hmap = &map->hmap2[i];
+#ifndef WORMHOLE_GLOBAL_SLAB
     if (hmap->slab1)
       slab_destroy(hmap->slab1);
     if (hmap->slab2)
       slab_destroy(hmap->slab2);
+#endif
     wormhmap_deinit(hmap);
   }
+
+#ifdef WORMHOLE_GLOBAL_SLAB
+  global_slab_release();
+#endif
 
   if (map->pbuf)
     free(map->pbuf);
@@ -1324,6 +1456,7 @@ wormhole_jump_leaf(const struct wormhmap * const hmap, const struct kref * const
 wormhole_jump_leaf_read(struct wormref * const ref, const struct kref * const key)
 {
   struct wormhole * const map = ref->map;
+#ifndef WORMHOLE_DISABLE_QSBR
 #pragma nounroll
   do {
     const struct wormhmap * const hmap = wormhmap_load(map);
@@ -1345,12 +1478,20 @@ wormhole_jump_leaf_read(struct wormref * const ref, const struct kref * const ke
       wormhole_qsbr_update_pause(ref, v1);
     } while (true);
   } while (true);
+#else
+  const struct wormhmap * const hmap = wormhmap_load(map);
+  // Find the leaf for key using the current hmap snapshot
+  struct wormleaf * const leaf = wormhole_jump_leaf(hmap, key);
+  wormleaf_lock_read(leaf, ref);  // Take the per-leaf read lock before returning
+  return leaf;
+#endif
 }
 
   static struct wormleaf *
 wormhole_jump_leaf_write(struct wormref * const ref, const struct kref * const key)
 {
   struct wormhole * const map = ref->map;
+#ifndef WORMHOLE_DISABLE_QSBR
 #pragma nounroll
   do {
     const struct wormhmap * const hmap = wormhmap_load(map);
@@ -1373,6 +1514,13 @@ wormhole_jump_leaf_write(struct wormref * const ref, const struct kref * const k
       wormhole_qsbr_update_pause(ref, v1);
     } while (true);
   } while (true);
+#else
+  const struct wormhmap * const hmap = wormhmap_load(map);
+  // Find the leaf for key using the current hmap snapshot
+  struct wormleaf * const leaf = wormhole_jump_leaf(hmap, key);
+  wormleaf_lock_write(leaf, ref);  // Take the per-leaf write lock before returning
+  return leaf;
+#endif
 }
 // }}} jump-rw
 
@@ -2159,9 +2307,15 @@ wormhole_get(struct wormref * const ref, const struct kref * const key, struct k
   struct kv *
 whsafe_get(struct wormref * const ref, const struct kref * const key, struct kv * const out)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
   wormhole_resume(ref);
   struct kv * const ret = wormhole_get(ref, key, out);
   wormhole_park(ref);
+#else
+  wormhmap_lock_read(ref->map, ref);
+  struct kv *ret = wormhole_get(ref, key, out);
+  wormhmap_unlock_read(ref->map);
+#endif
   return ret;
 }
 
@@ -2185,9 +2339,15 @@ wormhole_probe(struct wormref * const ref, const struct kref * const key)
   bool
 whsafe_probe(struct wormref * const ref, const struct kref * const key)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
   wormhole_resume(ref);
   const bool r = wormhole_probe(ref, key);
   wormhole_park(ref);
+#else
+  wormhmap_lock_read(ref->map, ref);
+  const bool r = wormhole_probe(ref, key);
+  wormhmap_unlock_read(ref->map);
+#endif
   return r;
 }
 
@@ -2204,7 +2364,11 @@ whunsafe_probe(struct wormhole * const map, const struct kref * const key)
   static struct wormmeta *
 wormmeta_expand(struct wormhmap * const hmap, struct wormmeta * const meta1)
 {
+#ifdef WORMHOLE_GLOBAL_SLAB
+  struct wormmeta * const meta2 = slab_alloc_safe(hmap->slab2);
+#else
   struct wormmeta * const meta2 = slab_alloc_unsafe(hmap->slab2);
+#endif
   if (meta2 == NULL)
     return NULL;
 
@@ -2218,7 +2382,11 @@ wormmeta_expand(struct wormhmap * const hmap, struct wormmeta * const meta1)
   meta2->bitmap[bitmin >> 6u] |= (1lu << (bitmin & 0x3fu));
 
   wormhmap_replace(hmap, meta1, meta2);
+#ifdef WORMHOLE_GLOBAL_SLAB
+  slab_free_safe(hmap->slab1, meta1);
+#else
   slab_free_unsafe(hmap->slab1, meta1);
+#endif
   return meta2;
 }
 
@@ -2360,6 +2528,7 @@ wormhole_split_meta(struct wormref * const ref, struct wormleaf * const leaf2)
 
   wormmeta_split(hmap1, leaf2, mkey);
 
+#ifndef WORMHOLE_DISABLE_QSBR
   qsbr_update(&ref->qref, v1);
 
   // switch hmap
@@ -2369,6 +2538,14 @@ wormhole_split_meta(struct wormref * const ref, struct wormleaf * const leaf2)
   wormleaf_unlock_write(leaf2);
 
   qsbr_wait(map->qsbr, v1);
+#else
+  // switch hmap while still holding metalock
+  wormhmap_store(map, hmap1);
+
+  // release leaf locks before finishing old map update
+  wormleaf_unlock_write(leaf1);
+  wormleaf_unlock_write(leaf2);
+#endif
 
   wormmeta_split(hmap0, leaf2, mkey);
 
@@ -2451,14 +2628,22 @@ whunsafe_split_insert(struct wormhole * const map, struct wormleaf * const leaf1
 wormmeta_shrink(struct wormhmap * const hmap, struct wormmeta * const meta2)
 {
   debug_assert(wormmeta_bitmin_load(meta2) == wormmeta_bitmax_load(meta2));
+#ifdef WORMHOLE_GLOBAL_SLAB
+  struct wormmeta * const meta1 = slab_alloc_safe(hmap->slab1);
+#else
   struct wormmeta * const meta1 = slab_alloc_unsafe(hmap->slab1);
+#endif
   if (meta1 == NULL)
     return NULL;
 
   memcpy(meta1, meta2, sizeof(*meta1));
 
   wormhmap_replace(hmap, meta2, meta1);
+#ifdef WORMHOLE_GLOBAL_SLAB
+  slab_free_safe(hmap->slab2, meta2);
+#else
   slab_free_unsafe(hmap->slab2, meta2);
+#endif
   return meta1;
 }
 
@@ -2547,6 +2732,7 @@ wormhole_meta_merge(struct wormref * const ref, struct wormleaf * const leaf1,
 
   wormmeta_merge(hmap1, leaf2);
 
+#ifndef WORMHOLE_DISABLE_QSBR
   qsbr_update(&ref->qref, v1);
 
   // switch hmap
@@ -2559,6 +2745,18 @@ wormhole_meta_merge(struct wormref * const ref, struct wormleaf * const leaf1,
   qsbr_wait(map->qsbr, v1);
 
   wormmeta_merge(hmap0, leaf2);
+#else
+  wormhmap_store(map, hmap1);
+
+  if (unlock_leaf1)
+    wormleaf_unlock_write(leaf1);
+
+  // do merge before releasing leaf2 locks
+  wormmeta_merge(hmap0, leaf2);
+
+  wormleaf_unlock_write(leaf2);
+#endif
+
   // leaf2 is now safe to be removed
   wormleaf_free(map->slab_leaf, leaf2);
   wormhmap_unlock(map);
@@ -2828,9 +3026,15 @@ wormhole_inpw(struct wormref * const ref, const struct kref * const key,
 whsafe_inpr(struct wormref * const ref, const struct kref * const key,
     kv_inp_func uf, void * const priv)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
   wormhole_resume(ref);
   const bool r = wormhole_inpr(ref, key, uf, priv);
   wormhole_park(ref);
+#else
+  wormhmap_lock_read(ref->map, ref);
+  const bool r = wormhole_inpr(ref, key, uf, priv);
+  wormhmap_unlock_read(ref->map);
+#endif
   return r;
 }
 
@@ -3122,8 +3326,14 @@ wormhole_iter_seek(struct wormhole_iter * const iter, const struct kref * const 
   void
 whsafe_iter_seek(struct wormhole_iter * const iter, const struct kref * const key)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
   wormhole_resume(iter->ref);
   wormhole_iter_seek(iter, key);
+#else
+  wormhmap_lock_read(iter->ref->map, iter->ref);
+  wormhole_iter_seek(iter, key);
+  wormhmap_unlock_read(iter->ref->map);
+#endif
 }
 
   bool
@@ -3352,10 +3562,12 @@ wormhole_ref(struct wormhole * const map)
   if (ref == NULL)
     return NULL;
   ref->map = map;
+#ifndef WORMHOLE_DISABLE_QSBR
   if (qsbr_register(map->qsbr, &(ref->qref)) == false) {
     free(ref);
     return NULL;
   }
+#endif
   return ref;
 }
 
@@ -3372,7 +3584,9 @@ whsafe_ref(struct wormhole * const map)
 wormhole_unref(struct wormref * const ref)
 {
   struct wormhole * const map = ref->map;
+#ifndef WORMHOLE_DISABLE_QSBR
   qsbr_unregister(map->qsbr, &(ref->qref));
+#endif
   free(ref);
   return map;
 }
@@ -3380,19 +3594,32 @@ wormhole_unref(struct wormref * const ref)
   inline void
 wormhole_park(struct wormref * const ref)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
+  wormhole_refresh_qstate(ref);
   qsbr_park(&(ref->qref));
+#else
+  (void) ref;
+#endif
 }
 
   inline void
 wormhole_resume(struct wormref * const ref)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
   qsbr_resume(&(ref->qref));
+#else
+  (void) ref;
+#endif
 }
 
   inline void
 wormhole_refresh_qstate(struct wormref * const ref)
 {
+#ifndef WORMHOLE_DISABLE_QSBR
   qsbr_update(&(ref->qref), wormhmap_version_load(wormhmap_load(ref->map)));
+#else
+  (void) ref;
+#endif
 }
 
   static void
@@ -3406,13 +3633,25 @@ wormhole_clean_hmap(struct wormhole * const map)
     struct wormmbkt * const pmap = hmap->pmap;
     for (u64 s = 0; s < nr_slots; s++) {
       struct wormmbkt * const slot = &(pmap[s]);
+#ifdef WORMHOLE_GLOBAL_SLAB
+      for (u32 i = 0; i < WH_BKT_NR; i++) {
+        struct wormmeta *meta = slot->e[i];
+        if (meta) {
+          wormmeta_free(hmap, meta);
+          slot->e[i] = NULL;
+        }
+      }
+#else
       for (u32 i = 0; i < WH_BKT_NR; i++)
         if (slot->e[i])
           wormmeta_keyref_release(slot->e[i]);
+#endif
     }
 
+#ifndef WORMHOLE_GLOBAL_SLAB
     slab_free_all(hmap->slab1);
     slab_free_all(hmap->slab2);
+#endif
     memset(hmap->pmap, 0, hmap->msize);
     hmap->maxplen = 0;
   }
@@ -3434,9 +3673,18 @@ wormhole_free_leaf_keys(struct wormhole * const map, struct wormleaf * const lea
 wormhole_clean_helper(struct wormhole * const map)
 {
   wormhole_clean_hmap(map);
+#ifdef WORMHOLE_GLOBAL_SLAB
+  for (struct wormleaf * leaf = map->leaf0; leaf; ) {
+    wormhole_free_leaf_keys(map, leaf);
+    struct wormleaf* next_leaf = leaf->next; // avoid use after free
+    slab_free_safe(map->slab_leaf, leaf);
+    leaf = next_leaf;
+  }
+#else
   for (struct wormleaf * leaf = map->leaf0; leaf; leaf = leaf->next)
     wormhole_free_leaf_keys(map, leaf);
   slab_free_all(map->slab_leaf);
+#endif
   map->leaf0 = NULL;
 }
 
@@ -3454,14 +3702,20 @@ wormhole_destroy(struct wormhole * const map)
   wormhole_clean_helper(map);
   for (u32 i = 0; i < 2; i++) {
     struct wormhmap * const hmap = &map->hmap2[i];
+#ifndef WORMHOLE_GLOBAL_SLAB
     if (hmap->slab1)
       slab_destroy(hmap->slab1);
     if (hmap->slab2)
       slab_destroy(hmap->slab2);
+#endif
     wormhmap_deinit(hmap);
   }
+#ifndef WORMHOLE_DISABLE_QSBR
   qsbr_destroy(map->qsbr);
-  slab_destroy(map->slab_leaf);
+#endif
+#ifdef WORMHOLE_GLOBAL_SLAB
+  global_slab_release();
+#endif
   free(map->pbuf);
   free(map);
 }

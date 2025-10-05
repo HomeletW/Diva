@@ -155,8 +155,8 @@ private:
     };
 
     struct InfixStore {
-        static const uint32_t size_grade_bit_count = 8;
-        static const uint32_t elem_count_bit_count = 20;
+        static constexpr uint32_t size_grade_bit_count = 8;
+        static constexpr uint32_t elem_count_bit_count = 20;
 
         uint32_t status = 0;
         uint64_t *ptr = nullptr;
@@ -180,7 +180,7 @@ private:
         }
 
         static uint32_t GetPtrWordCount(const uint32_t slot_count, const uint32_t slot_size) {
-            return 1 + (Diva::infix_store_target_size + slot_count * (slot_size + 1) + 63) / 64;
+            return 1 + (Diva::infix_store_target_size + slot_count * (slot_size + 1) + 63) / 64 + 1;
         }
 
         uint32_t GetElemCount() const {
@@ -240,6 +240,8 @@ private:
 
     uint32_t bulk_load_streaming_ind_, bulk_load_streaming_max_len_;
     InfiniteByteString bulk_load_left_key_, bulk_load_key_list_[infix_store_target_size];
+
+    const bool read_only_ = false;
 
     void AddTreeKey(const uint8_t *key, const uint32_t key_len);
     void InsertSimple(const InfiniteByteString key);
@@ -321,7 +323,8 @@ inline Diva<int_optimized>::Diva(const uint32_t infix_size, const uint32_t rng_s
             infix_size_(infix_size),
             rng_seed_(rng_seed),
             load_factor_(load_factor),
-            bulk_load_streaming_ind_(0) {
+            bulk_load_streaming_ind_(0),
+            read_only_(false) {
     if constexpr (int_optimized) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -346,7 +349,8 @@ Diva<int_optimized>::Diva(const uint32_t infix_size, const t_itr begin, const t_
         infix_size_(infix_size),
         rng_seed_(rng_seed),
         load_factor_(load_factor),
-        bulk_load_streaming_ind_(0) {
+        bulk_load_streaming_ind_(0),
+        read_only_(false) {
     if constexpr (int_optimized) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -380,7 +384,8 @@ Diva<int_optimized>::Diva(const uint32_t infix_size, const t_itr begin, const t_
         infix_size_(infix_size),
         rng_seed_(rng_seed),
         load_factor_(load_factor),
-        bulk_load_streaming_ind_(0) {
+        bulk_load_streaming_ind_(0),
+        read_only_(false) {
     if constexpr (int_optimized) {
         wh_int_ = wh_int_create();
         better_tree_int_ = wh_int_ref(wh_int_);
@@ -1274,7 +1279,7 @@ inline uint32_t Diva<int_optimized>::SerializeInfixStore(char *out, const Diva<i
 
 template <bool int_optimized>
 inline Diva<int_optimized>::Diva(char *deser_buf):
-        bulk_load_streaming_ind_(0) {
+        bulk_load_streaming_ind_(0), read_only_(true) {
     uint32_t ind = DeserializeMetadata(deser_buf);
     if constexpr (int_optimized) {
         wh_int_ = wh_int_create();
@@ -1324,33 +1329,39 @@ inline Diva<int_optimized>::~Diva() {
     InfixStore *store;
 
     if constexpr (int_optimized) {
-        wormhole_int_iter it_int;
-        it_int.ref = better_tree_int_;
-        it_int.map = better_tree_int_->map;
-        it_int.leaf = nullptr;
-        it_int.is = 0;
-        for (wh_int_iter_seek(&it_int, nullptr, 0); wh_int_iter_valid(&it_int); wh_int_iter_skip1(&it_int)) {
-            wh_int_iter_peek_ref(&it_int, reinterpret_cast<const void **>(&tree_key), &tree_key_len, 
-                                          reinterpret_cast<void **>(&store), &dummy);
-            delete[] store->ptr;
+        if (!read_only_) {
+            wormhole_int_iter it_int;
+            it_int.ref = better_tree_int_;
+            it_int.map = better_tree_int_->map;
+            it_int.leaf = nullptr;
+            it_int.is = 0;
+            for (wh_int_iter_seek(&it_int, nullptr, 0); wh_int_iter_valid(&it_int); wh_int_iter_skip1(&it_int)) {
+                wh_int_iter_peek_ref(&it_int, reinterpret_cast<const void **>(&tree_key), &tree_key_len,
+                                              reinterpret_cast<void **>(&store), &dummy);
+                delete[] store->ptr;
+            }
+            if (it_int.leaf)
+                wormleaf_int_unlock_read(it_int.leaf);
         }
-        if (it_int.leaf)
-            wormleaf_int_unlock_read(it_int.leaf);
+        wh_int_unref(better_tree_int_);
         wh_int_destroy(wh_int_);
     }
     else {
-        wormhole_iter it;
-        it.ref = better_tree_;
-        it.map = better_tree_->map;
-        it.leaf = nullptr;
-        it.is = 0;
-        for (wh_iter_seek(&it, nullptr, 0); wh_iter_valid(&it); wh_iter_skip1(&it)) {
-            wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&tree_key), &tree_key_len, 
-                                  reinterpret_cast<void **>(&store), &dummy);
-            delete[] store->ptr;
+        if (!read_only_) {
+            wormhole_iter it;
+            it.ref = better_tree_;
+            it.map = better_tree_->map;
+            it.leaf = nullptr;
+            it.is = 0;
+            for (wh_iter_seek(&it, nullptr, 0); wh_iter_valid(&it); wh_iter_skip1(&it)) {
+                wh_iter_peek_ref(&it, reinterpret_cast<const void **>(&tree_key), &tree_key_len,
+                                      reinterpret_cast<void **>(&store), &dummy);
+                delete[] store->ptr;
+            }
+            if (it.leaf)
+                wormleaf_unlock_read(it.leaf);
         }
-        if (it.leaf)
-            wormleaf_unlock_read(it.leaf);
+        wh_unref(better_tree_);
         wh_destroy(wh_);
     }
 }
@@ -1970,6 +1981,7 @@ inline void Diva<int_optimized>::BulkLoadStreamingFinish() {
     AddTreeKey(key_copy, bulk_load_streaming_max_len_);
     memset(key_copy, 0xFF, bulk_load_streaming_max_len_);
     AddTreeKey(key_copy, bulk_load_streaming_max_len_);
+    delete[] key_copy;
 
     if (bulk_load_streaming_ind_ > 0) {
         InfiniteByteString bulk_load_right_key {bulk_load_key_list_[bulk_load_streaming_ind_ - 1].str,
