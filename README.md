@@ -50,6 +50,30 @@ All these options are set by default. To turn one off, for example,
 cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=0
 ```
 
+# Global Slab (multi-instance optimization)
+
+By default, each Wormhole instance maintains its own slab allocator. In applications that host many instances (e.g., an LSM tree where each sorted run builds a separate Diva), this per-instance design adds measurable setup/teardown overhead.
+
+The **global slab** optimization lets all active Wormhole instances share a single, process-wide slab allocator. The shared allocator is created on the first Wormhole initialization and destroyed after the last instance is torn down, amortizing allocator lifecycle costs across instances.
+
+Enable this feature with the following preprocessor macros:
+
+```c++
+// Enable a process-wide shared slab allocator for all Wormhole instances.
+#define WORMHOLE_GLOBAL_SLAB
+
+// Disable QSBR (Quiescent State Based Reclamation) and use a read–write lock instead.
+#define WORMHOLE_DISABLE_QSBR
+```
+
+### Notes
+
+* **`WORMHOLE_GLOBAL_SLAB`**: Activates the shared allocator so multiple instances reuse the same slabs instead of each managing its own.
+
+* **`WORMHOLE_DISABLE_QSBR`**: Turns off QSBR and switches synchronization to a read–write lock. This is useful when instances are effectively **read-only** or **write-only** and do not require concurrent reclamation (e.g., RocksDB’s `FilterBitsReader` and `FilterBitsWriter` operate on separate Diva instances).
+
+To fully enable the Global Slab optimization, define **both** `WORMHOLE_GLOBAL_SLAB` and `WORMHOLE_DISABLE_QSBR`.
+
 # Running Unit Tests
 After building Diva, run the following command from the project's root
 directory to execute the unit tests:
